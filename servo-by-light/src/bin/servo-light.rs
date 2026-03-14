@@ -177,11 +177,11 @@ fn main() -> ! {
     let mut pwm = pwm_slices.pwm1;
 
     // 125MHz clock / 125 divider = 1MHz → 1µs per tick
-    pwm.set_ph_correct();
+    // pwm.set_ph_correct();
     pwm.set_div_int(125);
     pwm.set_div_frac(0);
     // 50Hz: 1_000_000 / 50 = 20_000 ticks per period
-    pwm.set_top(20_000);
+    pwm.set_top(19_999);
     pwm.enable();
 
     let channel = &mut pwm.channel_a;
