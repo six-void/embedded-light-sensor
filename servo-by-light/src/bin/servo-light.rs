@@ -23,6 +23,10 @@ use usbd_serial::SerialPort;
 use core::fmt::Write;
 use heapless::String;
 
+use embedded_hal::pwm::SetDutyCycle;
+use panic_halt as _;
+use rp235x_hal::{ clocks::init_clocks_and_plls, pac, pwm, watchdog::Watchdog, Sio};
+
 #[link_section = ".start_block"]
 #[used]
 pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
@@ -73,6 +77,12 @@ fn veml7700_read_lux<I: I2c>(
 
     // Apply gain: lux = raw * 0.4608, rounded to nearest integer
     (raw * GAIN_SCALED + GAIN_DIVISOR / 2) / GAIN_DIVISOR
+}
+
+/// Convert a desired pulse width in microseconds to a PWM compare value.
+/// PWM runs at 50Hz (20ms period), top = 20_000, each count = 1µs.
+fn us_to_pwm(us: u16) -> u16 {
+    us
 }
 
 fn serial_write_all(serial: &mut SerialPort<hal::usb::UsbBus>, s: &str) {
@@ -162,6 +172,26 @@ fn main() -> ! {
         }
     }
 
+    // Set up PWM slice 0, channel A → GP0
+    let pwm_slices = pwm::Slices::new(peripherals.PWM, &mut peripherals.RESETS);
+    let mut pwm = pwm_slices.pwm1;
+
+    // 125MHz clock / 125 divider = 1MHz → 1µs per tick
+    pwm.set_ph_correct();
+    pwm.set_div_int(125);
+    pwm.set_div_frac(0);
+    // 50Hz: 1_000_000 / 50 = 20_000 ticks per period
+    pwm.set_top(20_000);
+    pwm.enable();
+
+    let channel = &mut pwm.channel_a;
+    channel.output_to(pins.gpio2);
+
+    // --- Sweep the servo: left → center → right → center → repeat ---
+    let positions: [u16; 4] = [1000, 1500, 2000, 1500]; // µs
+    let left = 1000;
+    let right = 2000;
+    
     serial_write_all(&mut serial, "VEML7700 Light Sensor ready\r\n");
 
     // --- Main loop ---
@@ -186,11 +216,27 @@ fn main() -> ! {
         // LED on if dark (< 39 lux), off otherwise
         if lux < 39 {
             led_pin.set_high().unwrap();
+
+            channel.set_duty_cycle(us_to_pwm(left)).unwrap();
+
+            // Hold each position for ~1 second (busy loop)
+            // Replace with a proper timer/delay in real projects
+            cortex_m::asm::delay(125_000_000);
+
         } else {
             led_pin.set_low().unwrap();
+
+            channel.set_duty_cycle(us_to_pwm(right)).unwrap();
+
+            // Hold each position for ~1 second (busy loop)
+            // Replace with a proper timer/delay in real projects
+            cortex_m::asm::delay(125_000_000);
         }
     }
+    
+
 }
+
 
 #[link_section = ".bi_entries"]
 #[used]
