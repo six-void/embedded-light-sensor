@@ -151,6 +151,7 @@ fn main() -> ! {
     // --- Init VEML7700 sensor ---
     veml7700_init(&mut i2c);
 
+    //TODO: Remove or make this non-blocking
     // --- Wait for USB host to connect ---
     loop {
         if usb_dev.poll(&mut [&mut serial]) {
@@ -163,6 +164,8 @@ fn main() -> ! {
     }
 
     serial_write_all(&mut serial, "VEML7700 Light Sensor ready\r\n");
+
+    let mut state: CurtainState = CurtainState::Opened; 
 
     // --- Main loop ---
     loop {
@@ -184,12 +187,27 @@ fn main() -> ! {
         serial_write_all(&mut serial, s.as_str());
 
         // LED on if dark (< 39 lux), off otherwise
-        if lux < 39 {
-            led_pin.set_high().unwrap();
-        } else {
-            led_pin.set_low().unwrap();
+        match state {
+            CurtainState::Opened=>{
+                if lux < 9 {
+                    //TODO: open and stop
+                    led_pin.set_high().unwrap();
+                    state = CurtainState::Opened;
+                } 
+            }
+            CurtainState::Closed => {
+                if lux > 40 {
+                    //TODO: close and stop
+                    led_pin.set_low().unwrap();
+                    state = CurtainState::Closed;
+                } 
+            },
         }
     }
+}
+
+enum CurtainState {
+    Opened,Closed
 }
 
 #[link_section = ".bi_entries"]

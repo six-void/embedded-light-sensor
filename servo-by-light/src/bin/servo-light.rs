@@ -188,7 +188,6 @@ fn main() -> ! {
     channel.output_to(pins.gpio2);
 
     // --- Sweep the servo: left → center → right → center → repeat ---
-    let positions: [u16; 4] = [1000, 1500, 2000, 1500]; // µs
     let left = 1000;
     let right = 2000;
     
