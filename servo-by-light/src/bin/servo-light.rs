@@ -14,8 +14,10 @@ use rp235x_hal as hal;
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
 use embedded_hal::i2c::I2c;
+use embedded_hal::pwm::SetDutyCycle;
 
 use rp235x_hal::fugit::RateExtU32;
+use rp235x_hal::pwm;
 
 use usb_device::class_prelude::*;
 use usb_device::prelude::*;
@@ -24,41 +26,113 @@ use usbd_serial::SerialPort;
 use core::fmt::Write;
 use heapless::String;
 
-use embedded_hal::pwm::SetDutyCycle;
-use rp235x_hal::{clocks::init_clocks_and_plls, pac, pwm, watchdog::Watchdog, Sio};
+// --- Boot / linker blocks ---
 
 #[link_section = ".start_block"]
 #[used]
 pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
-const XTAL_FREQ_HZ: u32 = 12_000_000u32;
+#[link_section = ".bi_entries"]
+#[used]
+pub static PICOTOOL_ENTRIES: [hal::binary_info::EntryAddr; 5] = [
+    hal::binary_info::rp_cargo_bin_name!(),
+    hal::binary_info::rp_cargo_version!(),
+    hal::binary_info::rp_program_description!(c"VEML7700 Light Sensor"),
+    hal::binary_info::rp_cargo_homepage_url!(),
+    hal::binary_info::rp_program_build_attribute!(),
+];
 
-// VEML7700 I2C address
+// --- Constants ---
+
+const XTAL_FREQ_HZ: u32 = 12_000_000;
+
 const VEML7700_ADDR: u8 = 0x10;
-
-// VEML7700 registers
 const REG_ALS_CONF: u8 = 0x00;
-const REG_ALS_WH: u8 = 0x01;
-const REG_ALS_WL: u8 = 0x02;
-const REG_POW_SAV: u8 = 0x03;
-const REG_ALS: u8 = 0x04;
+const REG_ALS_WH:   u8 = 0x01;
+const REG_ALS_WL:   u8 = 0x02;
+const REG_POW_SAV:  u8 = 0x03;
+const REG_ALS:      u8 = 0x04;
 
-// Config bytes for IT=100ms, gain=1/8
+/// IT=100ms, gain=1/8
 const VEML_CONF: [u8; 2] = [0x00, 0x10];
 
-// Gain multiplier fixed-point: 0.4608 * 10000 = 4608
-const GAIN_SCALED: u32 = 4608;
-const GAIN_DIVISOR: u32 = 10000;
+/// Lux = raw * 0.4608; expressed as fixed-point * 10_000
+const GAIN_SCALED:  u32 = 4_608;
+const GAIN_DIVISOR: u32 = 10_000;
 
-// Lux thresholds with 10 lux hysteresis buffer
-const LUX_CLOSE_THRESHOLD: u32 = 9;  // below this → close curtain
-const LUX_OPEN_THRESHOLD: u32 = 19;  // above this (9 + 10) → open curtain
+const LUX_CLOSE_THRESHOLD: u32 = 9;   // below → close curtain
+const LUX_OPEN_THRESHOLD:  u32 = 19;  // above → open curtain (10 lux hysteresis)
+
+/// PWM pulse widths in microseconds (125 MHz / 125 = 1 µs/tick, top = 19_999 → 50 Hz)
+const PWM_LEFT:   u16 = 1_000; // spin-close direction
+const PWM_CENTER: u16 = 1_500; // stop
+const PWM_RIGHT:  u16 = 2_000; // spin-open direction
+
+// --- Curtain state ---
+
+#[derive(defmt::Format, Clone, Copy, PartialEq, Eq)]
+enum CurtainState {
+    Opened,
+    Closed,
+}
+
+impl CurtainState {
+    fn as_str(self) -> &'static str {
+        match self {
+            CurtainState::Opened => "Opened",
+            CurtainState::Closed => "Closed",
+        }
+    }
+
+    /// Pure transition: given current state + lux, return the next state.
+    fn next(self, lux: u32) -> CurtainState {
+        match self {
+            CurtainState::Opened if lux < LUX_CLOSE_THRESHOLD => CurtainState::Closed,
+            CurtainState::Closed if lux > LUX_OPEN_THRESHOLD  => CurtainState::Opened,
+            _ => self,
+        }
+    }
+
+    /// Which PWM pulse to drive the motor with for this transition.
+    fn motor_pulse(self) -> u16 {
+        match self {
+            CurtainState::Closed => PWM_LEFT,   // closing
+            CurtainState::Opened => PWM_RIGHT,  // opening
+        }
+    }
+
+    fn log_message(self) -> &'static str {
+        match self {
+            CurtainState::Closed => "Closing curtain...\r\n",
+            CurtainState::Opened => "Opening curtain...\r\n",
+        }
+    }
+
+    fn done_message(self) -> &'static str {
+        match self {
+            CurtainState::Closed => "Curtain closed.\r\n",
+            CurtainState::Opened => "Curtain opened.\r\n",
+        }
+    }
+}
+
+// --- VEML7700 driver ---
 
 fn veml7700_init<I: I2c>(i2c: &mut I) {
-    i2c.write(VEML7700_ADDR, &[REG_ALS_CONF, VEML_CONF[0], VEML_CONF[1]]).ok();
-    i2c.write(VEML7700_ADDR, &[REG_ALS_WH, 0x00, 0x00]).ok();
-    i2c.write(VEML7700_ADDR, &[REG_ALS_WL, 0x00, 0x00]).ok();
-    i2c.write(VEML7700_ADDR, &[REG_POW_SAV, 0x00, 0x00]).ok();
+    let _ = i2c.write(VEML7700_ADDR, &[REG_ALS_CONF, VEML_CONF[0], VEML_CONF[1]]);
+    let _ = i2c.write(VEML7700_ADDR, &[REG_ALS_WH,   0x00, 0x00]);
+    let _ = i2c.write(VEML7700_ADDR, &[REG_ALS_WL,   0x00, 0x00]);
+    let _ = i2c.write(VEML7700_ADDR, &[REG_POW_SAV,  0x00, 0x00]);
+}
+
+fn veml7700_read_raw<I: I2c>(i2c: &mut I) -> u32 {
+    let mut buf = [0u8; 2];
+    let _ = i2c.write_read(VEML7700_ADDR, &[REG_ALS], &mut buf);
+    buf[0] as u32 | ((buf[1] as u32) << 8)
+}
+
+fn raw_to_lux(raw: u32) -> u32 {
+    (raw * GAIN_SCALED + GAIN_DIVISOR / 2) / GAIN_DIVISOR
 }
 
 fn veml7700_read_lux<I: I2c>(
@@ -66,25 +140,65 @@ fn veml7700_read_lux<I: I2c>(
     timer: &mut hal::Timer<hal::timer::CopyableTimer0>,
 ) -> u32 {
     timer.delay_ms(40);
-    let mut buf = [0u8; 2];
-    i2c.write_read(VEML7700_ADDR, &[REG_ALS], &mut buf).ok();
-    let raw = buf[0] as u32 + buf[1] as u32 * 256;
-    (raw * GAIN_SCALED + GAIN_DIVISOR / 2) / GAIN_DIVISOR
+    raw_to_lux(veml7700_read_raw(i2c))
 }
 
-fn us_to_pwm(us: u16) -> u16 {
-    us
-}
+// --- USB helpers ---
 
-fn serial_write_all(serial: &mut SerialPort<hal::usb::UsbBus>, s: &str) {
+fn serial_write<B: UsbBus>(serial: &mut SerialPort<B>, s: &str) {
     let mut bytes = s.as_bytes();
     while !bytes.is_empty() {
         match serial.write(bytes) {
-            Ok(n) => bytes = &bytes[n..],
+            Ok(n)  => bytes = &bytes[n..],
             Err(_) => break,
         }
     }
 }
+
+/// Poll USB, discarding any incoming bytes. Returns true if the device is configured.
+fn usb_poll<B: UsbBus>(
+    usb_dev: &mut UsbDevice<B>,
+    serial: &mut SerialPort<B>,
+) -> bool {
+    if usb_dev.poll(&mut [serial]) {
+        let mut buf = [0u8; 64];
+        let _ = serial.read(&mut buf);
+    }
+    usb_dev.state() == UsbDeviceState::Configured
+}
+
+/// Delay `ms` milliseconds while keeping the USB stack alive.
+fn delay_with_usb<B: UsbBus>(
+    timer: &mut hal::Timer<hal::timer::CopyableTimer0>,
+    usb_dev: &mut UsbDevice<B>,
+    serial: &mut SerialPort<B>,
+    ms: u32,
+) {
+    let ticks = ms / 10;
+    for _ in 0..ticks {
+        usb_dev.poll(&mut [serial]);
+        timer.delay_ms(10);
+    }
+}
+
+// --- Motor helpers ---
+
+fn motor_run<B: UsbBus>(
+    channel: &mut impl SetDutyCycle,
+    timer: &mut hal::Timer<hal::timer::CopyableTimer0>,
+    usb_dev: &mut UsbDevice<B>,
+    serial: &mut SerialPort<B>,
+    pulse: u16,
+    duration_ms: u32,
+) {
+    channel.set_duty_cycle(pulse).unwrap();
+    delay_with_usb(timer, usb_dev, serial, duration_ms);
+    channel.set_duty_cycle(PWM_CENTER).unwrap();
+    timer.delay_ms(200);
+    channel.set_duty_cycle(0).unwrap();
+}
+
+// --- Entry point ---
 
 #[hal::entry]
 fn main() -> ! {
@@ -102,7 +216,11 @@ fn main() -> ! {
     )
     .unwrap();
 
-    let mut timer = hal::Timer::new_timer0(peripherals.TIMER0, &mut peripherals.RESETS, &clocks);
+    let mut timer = hal::Timer::new_timer0(
+        peripherals.TIMER0,
+        &mut peripherals.RESETS,
+        &clocks,
+    );
 
     let sio = hal::Sio::new(peripherals.SIO);
     let pins = hal::gpio::Pins::new(
@@ -112,7 +230,7 @@ fn main() -> ! {
         &mut peripherals.RESETS,
     );
 
-    // --- USB Serial setup ---
+    // USB serial
     let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
         peripherals.USB,
         peripherals.USB_DPRAM,
@@ -120,8 +238,7 @@ fn main() -> ! {
         true,
         &mut peripherals.RESETS,
     ));
-
-    let mut serial = SerialPort::new(&usb_bus);
+    let mut serial  = SerialPort::new(&usb_bus);
     let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
         .strings(&[StringDescriptors::default()
             .manufacturer("rp235x")
@@ -131,169 +248,73 @@ fn main() -> ! {
         .device_class(usbd_serial::USB_CLASS_CDC)
         .build();
 
-    // --- I2C setup: SDA=GP0, SCL=GP1, PullUp, 400kHz ---
-    let sda_light: hal::gpio::Pin<_, hal::gpio::FunctionI2C, hal::gpio::PullUp> =
+    // I2C on GP0/GP1 at 400 kHz
+    let sda: hal::gpio::Pin<_, hal::gpio::FunctionI2C, hal::gpio::PullUp> =
         pins.gpio0.reconfigure();
-    let scl_light: hal::gpio::Pin<_, hal::gpio::FunctionI2C, hal::gpio::PullUp> =
+    let scl: hal::gpio::Pin<_, hal::gpio::FunctionI2C, hal::gpio::PullUp> =
         pins.gpio1.reconfigure();
-
     let mut i2c = hal::I2C::i2c0(
         peripherals.I2C0,
-        sda_light,
-        scl_light,
+        sda,
+        scl,
         400_000u32.Hz(),
         &mut peripherals.RESETS,
         &clocks.system_clock,
     );
 
-    // --- LED setup ---
-    let mut led_pin = pins.gpio25.into_push_pull_output();
+    // LED on GP25
+    let mut led = pins.gpio25.into_push_pull_output();
 
-    // --- Init VEML7700 sensor ---
-    veml7700_init(&mut i2c);
-
-    // --- Wait for USB host to connect ---
-    loop {
-        if usb_dev.poll(&mut [&mut serial]) {
-            let mut buf = [0u8; 64];
-            let _ = serial.read(&mut buf);
-        }
-        if usb_dev.state() == UsbDeviceState::Configured {
-            break;
-        }
-    }
-
-    // --- PWM setup: slice 1, channel A → GP2 ---
-    let pwm_slices = pwm::Slices::new(peripherals.PWM, &mut peripherals.RESETS);
+    // PWM slice 1, channel A → GP2; 125 MHz / 125 = 1 µs/tick, 50 Hz
+    let mut pwm_slices = pwm::Slices::new(peripherals.PWM, &mut peripherals.RESETS);
     let mut pwm = pwm_slices.pwm1;
-
-    // 125MHz / 125 = 1MHz → 1µs per tick
     pwm.set_div_int(125);
     pwm.set_div_frac(0);
-    // 50Hz: 1_000_000 / 50 = 20_000 ticks
     pwm.set_top(19_999);
     pwm.enable();
-
     let channel = &mut pwm.channel_a;
     channel.output_to(pins.gpio2);
 
-    let left   = 1000u16; // spin close direction
-    let right  = 2000u16; // spin open direction
-    let center = 1500u16; // stop
+    veml7700_init(&mut i2c);
 
-    serial_write_all(&mut serial, "VEML7700 Light Sensor ready\r\n");
+    // Wait for USB host
+    while !usb_poll(&mut usb_dev, &mut serial) {}
+
+    serial_write(&mut serial, "VEML7700 Light Sensor ready\r\n");
 
     let mut state = CurtainState::Opened;
 
-    // --- Main loop ---
     loop {
-        // Poll USB for ~1 second between readings
-        for _ in 0..100 {
-            if usb_dev.poll(&mut [&mut serial]) {
-                let mut buf = [0u8; 64];
-                let _ = serial.read(&mut buf);
-            }
-            timer.delay_ms(10);
-        }
+        delay_with_usb(&mut timer, &mut usb_dev, &mut serial, 1_000);
 
-        let lux = veml7700_read_lux(&mut i2c, &mut timer);
+        let lux  = veml7700_read_lux(&mut i2c, &mut timer);
+        let next = state.next(lux);
 
         let mut s: String<64> = String::new();
         write!(s, "Lux: {} State: {}\r\n", lux, state.as_str()).ok();
-        serial_write_all(&mut serial, s.as_str());
+        serial_write(&mut serial, s.as_str());
 
-        match state {
-            CurtainState::Opened => {
-                if lux < LUX_CLOSE_THRESHOLD {
-                    serial_write_all(&mut serial, "Closing curtain...\r\n");
-                    led_pin.set_high().unwrap();
-
-                    // Spin close direction for 5 seconds
-                    channel.set_duty_cycle(us_to_pwm(left)).unwrap();
-                    for _ in 0..500 {
-                        if usb_dev.poll(&mut [&mut serial]) {
-                            let mut buf = [0u8; 64];
-                            let _ = serial.read(&mut buf);
-                        }
-                        timer.delay_ms(10);
-                    }
-
-                    // Stop servo: brief neutral pulse then cut signal
-                    channel.set_duty_cycle(us_to_pwm(center)).unwrap();
-                    timer.delay_ms(200);
-                    channel.set_duty_cycle(0).unwrap();
-
-                    state = CurtainState::Closed;
-                    serial_write_all(&mut serial, "Curtain closed.\r\n");
-
-                    // Cooldown: 5 seconds before next lux reading
-                    for _ in 0..500 {
-                        if usb_dev.poll(&mut [&mut serial]) {
-                            let mut buf = [0u8; 64];
-                            let _ = serial.read(&mut buf);
-                        }
-                        timer.delay_ms(10);
-                    }
-                }
+        if next != state {
+            serial_write(&mut serial, next.log_message());
+            match next {
+                CurtainState::Closed => led.set_high().unwrap(),
+                CurtainState::Opened => led.set_low().unwrap(),
             }
-            CurtainState::Closed => {
-                if lux > LUX_OPEN_THRESHOLD {
-                    serial_write_all(&mut serial, "Opening curtain...\r\n");
-                    led_pin.set_low().unwrap();
 
-                    // Spin open direction for 5 seconds
-                    channel.set_duty_cycle(us_to_pwm(right)).unwrap();
-                    for _ in 0..500 {
-                        if usb_dev.poll(&mut [&mut serial]) {
-                            let mut buf = [0u8; 64];
-                            let _ = serial.read(&mut buf);
-                        }
-                        timer.delay_ms(10);
-                    }
+            motor_run(
+                channel,
+                &mut timer,
+                &mut usb_dev,
+                &mut serial,
+                next.motor_pulse(),
+                5_000,
+            );
 
-                    // Stop servo: brief neutral pulse then cut signal
-                    channel.set_duty_cycle(us_to_pwm(center)).unwrap();
-                    timer.delay_ms(200);
-                    channel.set_duty_cycle(0).unwrap();
+            serial_write(&mut serial, next.done_message());
+            state = next;
 
-                    state = CurtainState::Opened;
-                    serial_write_all(&mut serial, "Curtain opened.\r\n");
-
-                    // Cooldown: 5 seconds before next lux reading
-                    for _ in 0..500 {
-                        if usb_dev.poll(&mut [&mut serial]) {
-                            let mut buf = [0u8; 64];
-                            let _ = serial.read(&mut buf);
-                        }
-                        timer.delay_ms(10);
-                    }
-                }
-            }
+            // Cooldown before next reading
+            delay_with_usb(&mut timer, &mut usb_dev, &mut serial, 5_000);
         }
     }
 }
-
-#[derive(defmt::Format)]
-enum CurtainState {
-    Opened,
-    Closed,
-}
-
-impl CurtainState {
-    fn as_str(&self) -> &'static str {
-        match self {
-            CurtainState::Opened => "Opened",
-            CurtainState::Closed => "Closed",
-        }
-    }
-}
-
-#[link_section = ".bi_entries"]
-#[used]
-pub static PICOTOOL_ENTRIES: [hal::binary_info::EntryAddr; 5] = [
-    hal::binary_info::rp_cargo_bin_name!(),
-    hal::binary_info::rp_cargo_version!(),
-    hal::binary_info::rp_program_description!(c"VEML7700 Light Sensor"),
-    hal::binary_info::rp_cargo_homepage_url!(),
-    hal::binary_info::rp_program_build_attribute!(),
-];
