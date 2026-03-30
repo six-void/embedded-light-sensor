@@ -266,7 +266,7 @@ fn main() -> ! {
     let mut led = pins.gpio25.into_push_pull_output();
 
     // PWM slice 1, channel A → GP2; 125 MHz / 125 = 1 µs/tick, 50 Hz
-    let mut pwm_slices = pwm::Slices::new(peripherals.PWM, &mut peripherals.RESETS);
+    let pwm_slices = pwm::Slices::new(peripherals.PWM, &mut peripherals.RESETS);
     let mut pwm = pwm_slices.pwm1;
     pwm.set_div_int(125);
     pwm.set_div_frac(0);
